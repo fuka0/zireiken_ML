@@ -12,6 +12,7 @@ from sklearn.metrics import confusion_matrix
 import random
 import matplotlib.pyplot as plt
 import seaborn as sns
+from collections import defaultdict
 os.environ["OMP_NUM_THREADS"] = "1"
 
 
@@ -49,7 +50,7 @@ reduce_data = False # データ削減を有効にするか
 num_samples = 90  # 選択するサンプル数
 
 sss = StratifiedShuffleSplit(n_splits=5,random_state=17,test_size=0.2)
-sss_val = StratifiedShuffleSplit(n_splits=1,random_state=17,test_size=0.2)
+sss_val = StratifiedShuffleSplit(n_splits=1,random_state=17,test_size=0.1)
 
 for number_of_ch in number_of_chs:
     ch_idx, extracted_ch = select_electrode(number_of_ch)
@@ -142,13 +143,9 @@ for number_of_ch in number_of_chs:
                 history = model.fit(X_train_combined, y_train_combined, epochs=200, batch_size=12, validation_data=(X_val, y_val), callbacks=callbacks_list)
         # 転移学習part//////////////////////////////////
             group_results = []
-            sstl_train_acc_list = []
-            sstl_val_acc_list = []
 
             # データのロード
             X_sstl, y_sstl = load_data([target_subject_data_path], movement_types, ch_idx, n_class, number_of_ch)
-            # ラベルをカテゴリカルに変換
-            y_sstl = to_categorical(y_sstl, num_classes=n_class)
 
             if reduce_data:
                 # ランダムにデータを選択するためのインデックスを生成
@@ -182,12 +179,18 @@ for number_of_ch in number_of_chs:
                 # plot_model(global_model, to_file="SS-TL_model.png", show_shapes=True)
                 X_train_sstl, X_test_sstl = X_sstl[train], X_sstl[test]
                 y_train_sstl, y_test_sstl = y_sstl[train], y_sstl[test]
+                for train_idx_sstl, val_sstl in sss_val.split(X_train_sstl, y_train_sstl):
+                    X_train_sstl, X_val_sstl = X_train_sstl[train_idx_sstl], X_train_sstl[val_sstl]
+                    y_train_sstl, y_val_sstl = y_train_sstl[train_idx_sstl], y_train_sstl[val_sstl]
 
-
+                # ラベルをカテゴリカルに変換
+                y_train_sstl = to_categorical(y_train_sstl, num_classes=n_class)
+                y_test_sstl = to_categorical(y_test_sstl, num_classes=n_class)
+                y_val_sstl = to_categorical(y_val_sstl, num_classes=n_class)
                 sstl_callbacks_list = [EarlyStopping(monitor="val_loss", patience=4)]
 
                 # SS-TL学習
-                history_sstl = global_model.fit(X_train_sstl, y_train_sstl, epochs=30, batch_size=12, validation_data=(X_test_sstl, y_test_sstl), callbacks=sstl_callbacks_list)
+                history_sstl = global_model.fit(X_train_sstl, y_train_sstl, epochs=30, batch_size=12, validation_data=(X_val_sstl, y_val_sstl), callbacks=sstl_callbacks_list)
                 y_pred = global_model.predict(X_test_sstl)
 
                 y_pred_classes = np.argmax(y_pred, axis=1)
@@ -199,13 +202,72 @@ for number_of_ch in number_of_chs:
 
             # 混同行列の平均を計算
             average_conf_matrix = np.mean(conf_matrices, axis=0)
+            n_classes = average_conf_matrix.shape[0]
+            for i in range(n_classes):
+                TP = average_conf_matrix[i, i]
+                FP = sum(average_conf_matrix[:, i]) - TP
+                FN = sum(average_conf_matrix[i, :]) - TP
+                TN = sum(sum(average_conf_matrix)) - TP - FP - FN
+                # 評価指標を求める
+                accuracy = sum(average_conf_matrix.diagonal()) / sum(sum(average_conf_matrix))
+                recall = TP / (TP + FN)
+                precision = TP / (TP + FP)
+                f_value = 2 * precision * recall / (precision + recall)
+                group_results.append({f"task{i}_ACC": f"{accuracy * 100:.2f}", f"task{i}_PRE": f"{precision * 100:.2f}",
+                                    f"task{i}_REC": f"{recall * 100:.2f}", f"task{i}_F1": f"{f_value * 100:.2f}"})
 
-# 混同行列のヒートマップをプロット
-plt.figure(figsize=(8, 6))
-sns.heatmap(average_conf_matrix, annot=True, cmap="Blues", fmt=".1f",
-            xticklabels=["Left Fist", "Right Fist"],
-            yticklabels=["Left Fist", "Right Fist"])
-plt.ylabel('True Label')
-plt.xlabel('Predicted Label')
-plt.title('Average Confusion Matrix Heatmap')
-plt.show()
+            # グループの評価指標を加算
+            result = defaultdict(float)
+            for group_result in group_results:
+                for k, v in group_result.items():
+                    result[k] += float(v)
+            result = dict(result)
+
+            movetype = ["left_fist", "right_fist", "both_fists", "both_feet"]
+            # グループの評価指標の平均を求める
+            df_value = defaultdict(float)
+            subjects_num = len([target_subject_data_path])
+            for key, value in result.items():
+                if "macro" in key:
+                    pass
+                else:
+                    key = f"{movetype[int(key.split('_')[0][-1])]}_{key.split('_')[1]}"
+                df_value[key] = float(f"{value / subjects_num:.2f}")
+            df_value = dict(df_value)
+
+            # グループの評価指標の平均をDataFrameに入力
+            for column in df_value.keys():
+                if "macro" in column:
+                    df.loc[column] = df_value[column]
+                else:
+                    split_column = column.split('_')
+                    new_column = f"{split_column[0]}_{split_column[1]}"
+                    df.loc[split_column[2], new_column] = df_value[column]
+
+            # グループ平均の結果を出力
+            if preprocessing_dir == "DWT_data":
+                save_dir = current_dir / "ML" / "result"/ preprocessing_dir.split("_")[0] / f"decomposition_level{decompose_level}" / details_dir / ext_sec / "SS-TL_acc" / f"{number_of_ch}ch" / f"ds_{ds}" / f"{n_class}class"
+                os.makedirs(save_dir, exist_ok=True)
+            elif preprocessing_dir == "Envelope_data" or preprocessing_dir == "BPF_data":
+                save_dir = current_dir / "ML" / "result"/ preprocessing_dir.split("_")[0] / ext_sec / "SS-TL_acc" / f"{number_of_ch}ch" / f"ds_{ds}" / f"{n_class}class"
+                os.makedirs(save_dir, exist_ok=True)
+
+            save_path = save_dir / f"ave_evalute.xlsx"
+            sheet_name = "SS-TL_model_evaluate"
+            if target_subject_index == 1:
+                df.to_excel(save_path, sheet_name=sheet_name)
+            else:
+                with pd.ExcelWriter(save_path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
+                    df.to_excel(writer, startrow=0, startcol=target_subject_index*(len(columns)+2), sheet_name=sheet_name)
+
+            # 混同行列のヒートマップをプロット
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(average_conf_matrix, annot=True, cmap="Blues", fmt=".1f",
+                        xticklabels=["Left Fist", "Right Fist"],
+                        yticklabels=["Left Fist", "Right Fist"])
+            plt.ylabel('True Label')
+            plt.xlabel('Predicted Label')
+            plt.title(f'Average Confusion Matrix Heatmap {target_subject}')
+            plt.savefig(f"{save_dir}/{target_subject}_comf_martrix.png")
+            plt.close()
+            plt.clf()
